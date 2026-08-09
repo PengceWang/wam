@@ -1,0 +1,80 @@
+# Real stage-1 config: pretrained ~0.6B LLM backbone + SigLIP vision tower.
+#
+# Sized for a single 12GB card (the RTX 3060 in this machine). The readme's
+# 2x RTX 6000 Ada budget would let you raise seq_len to 32-64, batch_size to 8,
+# and n_visual_tokens to 32.
+#
+#   Backbone   Qwen3-0.6B          ~0.6B params, frozen in stage 1
+#   Vision     SigLIP base/16      ~93M params, frozen always
+#   Resampler  + heads             ~80-150M params, trainable
+#
+# First run downloads both checkpoints from HuggingFace.
+
+backbone:
+  model_name: Qwen/Qwen3-0.6B
+  dtype: bfloat16
+  attn_implementation: sdpa
+  # Must stay false: transformers disables the KV cache under checkpointing, and
+  # the rollout in WorldActionModel.step() carries history through that cache.
+  # Lower train.seq_len / batch_size instead if VRAM is tight.
+  gradient_checkpointing: false
+  n_trainable_top_layers: 0        # stage 1 = fully frozen LLM
+
+vision:
+  encoder_name: google/siglip-base-patch16-224
+  image_size: 224
+  n_visual_tokens: 16
+  resampler_depth: 2
+  resampler_heads: 8
+  freeze_encoder: true
+
+memory:
+  n_scene: 16
+  n_world: 16
+  n_skill: 8
+  n_drive: 8
+
+action:
+  chunk_size: 8
+  camera_bins: 21
+  camera_max_delta: 20.0
+  camera_mu: 40.0
+  n_hotbar: 9
+  n_action_tokens: 4
+
+event:
+  n_event_tokens: 8
+  vocab_size: 1024
+
+heads:
+  hidden_mult: 2
+  n_goal_tokens: 4
+  value_bins: 1
+
+loss:
+  next_latent: 1.0
+  event: 1.0
+  actor: 1.0
+  value: 0.5
+  goal: 0.1
+  language: 0.1
+  align: 1.0
+  prior_retention: 0.1   # only active from stage 3
+
+# Measured on the RTX 3060 (12GB), stage 1, bf16:
+#   batch 1 x seq  8  ->  1.7 s/step,  3.7 GiB
+#   batch 1 x seq 16  ->  3.3 s/step,  6.2 GiB   <- default
+#   batch 2 x seq 16  ->  8.7 s/step, 10.5 GiB   (too close to the limit)
+# The rollout is sequential over timesteps, so cost scales ~linearly in seq_len.
+train:
+  stage: 1
+  seq_len: 16            # 16 steps x 77 tokens = 1232 tokens of context
+  batch_size: 1
+  lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 20000
+  log_every: 20
+  device: cuda
+  seed: 0

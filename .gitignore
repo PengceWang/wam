@@ -1,0 +1,32 @@
+# Environments and caches
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Weights. The stage-1a checkpoint alone is 1.6GB.
+checkpoints/
+*.pt
+*.ckpt
+*.safetensors
+
+# Anything produced by a run
+logs/
+dryrun/
+runs/
+wandb/
+play_recordings/
+*.mp4
+*.npy
+
+# Datasets live outside the repo: the 6xx contractor subset is 175GB and the
+# window index is 150k rows. Both are reproducible -- see docs/measurements.md.
+data/
+*.mdb
+*_index_*.npz
+
+# Credentials never belong here. wandb writes to ~/.netrc.
+.netrc
+*.key
+.env

@@ -1,0 +1,43 @@
+# Smoke-test config: no downloads, runs on CPU in seconds.
+# Copy to a new file and swap `backbone.model_name` / `vision.encoder_name`
+# for a real run (see configs/qwen3-0.6b.yaml).
+
+backbone:
+  model_name: random
+  dtype: float32
+  random_hidden_size: 256
+  random_n_layers: 4
+  random_n_heads: 4
+  n_trainable_top_layers: 0
+
+vision:
+  encoder_name: random
+  image_size: 224
+  n_visual_tokens: 16
+  resampler_depth: 2
+  freeze_encoder: true
+
+memory:
+  n_scene: 16
+  n_world: 16
+  n_skill: 8
+  n_drive: 8
+
+action:
+  chunk_size: 8
+  camera_bins: 21
+  camera_max_delta: 20.0
+  camera_mu: 40.0
+  n_action_tokens: 4
+
+event:
+  n_event_tokens: 8
+  vocab_size: 1024
+
+train:
+  stage: 1
+  seq_len: 4
+  batch_size: 2
+  max_steps: 20
+  log_every: 5
+  device: cpu

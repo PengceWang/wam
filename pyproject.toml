@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wam"
+version = "0.1.0"
+description = "Pretrained Developmental World-Action Model: a pretrained LLM as the shared backbone for perception, world prediction, action, value, goal and memory in Minecraft."
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "transformers>=4.44.0",
+    "numpy",
+    "pyyaml",
+    "einops",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "huggingface-hub",
+]
+# Frame capture from a browser-hosted Minecraft. Windows-only.
+capture = [
+    "windows-capture; sys_platform == 'win32'",
+    "pywin32; sys_platform == 'win32'",
+    "mss",
+    "opencv-python",
+]
+
+[tool.setuptools.packages.find]
+include = ["wam*"]
+
+# PyPI ships CPU-only torch on Windows; pull the CUDA build explicitly.
+# RTX 3060 is sm_86, which CUDA 13 still supports.
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
