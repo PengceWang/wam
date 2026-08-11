@@ -49,6 +49,13 @@ def main() -> int:
     )
     ap.add_argument("--out", default="checkpoints/stage1a.pt")
     ap.add_argument(
+        "--random-goals",
+        action="store_true",
+        help="消融：把八条指令的 goal token 换成八个固定随机向量。readme 的怀疑是"
+        "'eight random vectors would probably work as well' —— 这个开关就是去证伪它。"
+        "如果结果和用真实文本嵌入一样，那主干的语言语义在这个尺度上没有参与工作。",
+    )
+    ap.add_argument(
         "--wandb", default=None, metavar="PROJECT", help="log to this Weights & Biases project"
     )
     ap.add_argument("--run-name", default=None)
@@ -92,6 +99,15 @@ def main() -> int:
 
     # Eight fixed instructions, embedded once with the backbone's own tokenizer.
     goal_table = instruction_goal_tokens(model, device)
+    if args.random_goals:
+        # 消融：八个固定随机向量，取代真实的文本嵌入。
+        # 关键是**匹配真实嵌入的均值和方差** —— 否则这个对比就混进了"尺度不同"
+        # 这个第二变量，赢了输了都说明不了问题。
+        g = torch.Generator(device="cpu").manual_seed(cfg.train.seed)
+        noise = torch.randn(goal_table.shape, generator=g).to(device)
+        noise = (noise - noise.mean()) / noise.std()
+        goal_table = (noise * goal_table.std() + goal_table.mean()).to(goal_table.dtype)
+        print("*** --random-goals：goal 槽里是八个随机向量，不是指令文本 ***")
     print(f"goal table {tuple(goal_table.shape)}")
 
     run = None

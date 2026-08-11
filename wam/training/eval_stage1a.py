@@ -85,8 +85,12 @@ def run_instruction(model, env, instruction: str, goal_table, steps: int = 20):
         # Bin indices, not degrees: the autocorrelation is about whether
         # successive decisions are related, and bins keep that while being
         # immune to the mu-law's nonlinearity.
-        cameras.append(action.camera[0].cpu().numpy())
-        pressed += action.buttons[0].cpu().numpy().mean(axis=0)
+        # .float() 不能省：ActionChunk 带着主干的 dtype，模型跑在 bfloat16 上，
+        # 而 numpy 没有这个 dtype。手工构造的测试 chunk 是 float32，所以这行能
+        # 通过任何 dry run，只在真模型驱动时才炸 —— measurements.md 记过同一个坑，
+        # minerl.py 和 play_server.py 都防住了，唯独这里漏了。
+        cameras.append(action.camera[0].long().cpu().numpy())
+        pressed += action.buttons[0].float().cpu().numpy().mean(axis=0)
 
         obs = env.step(action)
         if obs.event_text and "mined" in obs.event_text:

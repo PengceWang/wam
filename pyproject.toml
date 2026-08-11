@@ -15,6 +15,9 @@ dependencies = [
     "pyyaml",
     "einops",
     "tqdm",
+    "lmdb>=2.3.0",
+    "av>=18.0.0",
+    "opencv-python-headless>=5.0.0.93",
 ]
 
 [project.optional-dependencies]

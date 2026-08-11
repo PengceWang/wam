@@ -56,7 +56,7 @@ PAGE = """<!doctype html>
  button.you{background:#443;border-color:#885;color:#ffd}
  #who{font-size:15px;margin:6px 0}
 </style>
-<img id="game" src="/stream">
+<img id="game" src="/frame.jpg">
 <div id="side">
   <div id="hint">click the picture to capture the mouse &middot; Esc releases</div>
   <h2>who is playing</h2>
@@ -161,6 +161,24 @@ async function tick() {
   } catch (e) {}
 }
 setInterval(tick, 100);
+
+// 画面靠轮询单帧，不用 MJPEG 长连接。multipart/x-mixed-replace 在直连时没问题，
+// 但穿过会缓冲的反向代理（VSCode 端口转发就是）时，浏览器只拿得到第一帧，
+// 页面看起来完全静止、刷新才更新一次。轮询对代理没有任何要求。
+// 上一张没加载完就不发下一张，避免慢链路上排队积压。
+(function () {
+  const img = document.getElementById('game');
+  let busy = false;
+  const next = () => {
+    if (busy) return;
+    busy = true;
+    const probe = new Image();
+    probe.onload = () => { img.src = probe.src; busy = false; };
+    probe.onerror = () => { busy = false; };
+    probe.src = '/frame.jpg?t=' + Date.now();
+  };
+  setInterval(next, 60);
+})();
 </script>
 """
 
@@ -422,6 +440,10 @@ class Agent:
 
 def make_handler(world: World):
     class Handler(BaseHTTPRequestHandler):
+        # BaseHTTPRequestHandler 默认 HTTP/1.0：响应靠关连接结束、长度未知，
+        # 会被缓冲型代理整段吞掉。轮询路径要求每个响应都有 Content-Length，
+        # 1.1 + keep-alive 也省掉每帧一次的握手。
+        protocol_version = "HTTP/1.1"
         def log_message(self, *a):  # the request log would drown the game log
             pass
 
@@ -433,6 +455,21 @@ def make_handler(world: World):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/frame.jpg"):
+                # 单帧。带 Content-Length，所以任何代理都能立刻转发出去。
+                ok, buf = cv2.imencode(
+                    ".jpg", world.frame[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 80]
+                )
+                if not ok:
+                    self.send_error(500)
+                    return
+                data = buf.tobytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+                self.end_headers()
+                self.wfile.write(data)
             elif self.path == "/stream":
                 self.send_response(200)
                 self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")

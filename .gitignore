@@ -22,7 +22,12 @@ play_recordings/
 
 # Datasets live outside the repo: the 6xx contractor subset is 175GB and the
 # window index is 150k rows. Both are reproducible -- see docs/measurements.md.
-data/
+#
+# The leading slash matters. Without it this pattern matches a directory named
+# `data` at ANY depth, which silently swallowed the whole `wam/data/` package --
+# it was never committed, and every entry point imports it. Anchor it to the
+# repo root so only the dataset directory is ignored.
+/data/
 *.mdb
 *_index_*.npz
 
