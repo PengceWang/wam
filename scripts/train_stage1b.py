@@ -31,7 +31,7 @@ from wam.config import WAMConfig
 from wam.data.stage1a import goal_for, instruction_goal_tokens
 from wam.data.stage1b import Stage1bData
 from wam.model.wam import WorldActionModel
-from wam.training.losses import action_loss, next_latent_loss
+from wam.training.losses import action_loss, goal_loss, next_latent_loss
 from wam.training.trainer import configure_stage
 
 
@@ -59,6 +59,11 @@ def main() -> int:
     ap.add_argument("--event-weight", type=float, default=1.0)
     ap.add_argument("--flag-weight", type=float, default=1.0)
     ap.add_argument("--latent-weight", type=float, default=0.5)
+    ap.add_argument("--goal-weight", type=float, default=0.0,
+                    help="事后重标注（hindsight goals）的权重。>0 时把「接下来实际达成了"
+                         "什么」当作「它本来的目标」，让 goal 空间以结果为坐标，而不是"
+                         "查找表的第几行。默认 0（关闭），因为它必须排在事件管道之后 —— "
+                         "没有事件，「达成了什么」无从定义。")
     args = ap.parse_args()
 
     cfg = WAMConfig.from_yaml(args.config)
@@ -98,6 +103,16 @@ def main() -> int:
 
     n_seed = seed_concept_embeddings(model, args.concepts, device)
     print(f"用 LLM 短语嵌入初始化了 {n_seed:,} 个概念行（init_from_text，此前从未被调用）")
+
+    phrase_emb = None
+    if args.goal_weight > 0:
+        from wam.data.events import phrase_embedding_table
+
+        # 和 EventEmbedding 用同一张表：否则「模型脑子里的 mined oak log」和
+        # 「hindsight 说你达成了 mined oak log」会是两个不同的向量。
+        phrase_emb = phrase_embedding_table(model, args.concepts, device)
+        print(f"hindsight goals 已启用，权重 {args.goal_weight}"
+              f"（短语嵌入表 {tuple(phrase_emb.shape)}）")
 
     data = Stage1bData(cfg, args.root, args.index, args.concepts,
                        workers=args.workers, all_windows=args.all_windows)
@@ -145,6 +160,19 @@ def main() -> int:
         flag = (fl * flag_mask).sum() / (flag_mask.sum() * fl.shape[0] * fl.shape[1])
         loss = loss + args.flag_weight * flag
         parts["flag"] = flag.detach()
+
+        if phrase_emb is not None and batch.hindsight is not None:
+            # 多热 -> goal 空间的一个向量：把这一步之后实际达成的所有概念的
+            # 短语嵌入取平均。没有任何事发生的步被 mask 掉 —— 不是每个时刻都有
+            # 「达成」，对着空集编一个目标是噪声。
+            h = batch.hindsight.float()
+            n = h.sum(-1, keepdim=True)
+            tgt = (h @ phrase_emb) / n.clamp(min=1.0)
+            gmask = (n.squeeze(-1) > 0).float()
+            g = goal_loss(out.goal, tgt, gmask)
+            loss = loss + args.goal_weight * g
+            parts["goal"] = g.detach()
+            parts["goal%"] = gmask.mean().detach()
 
         optimiser.zero_grad(set_to_none=True)
         loss.backward()

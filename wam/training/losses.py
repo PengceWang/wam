@@ -40,6 +40,9 @@ class Batch:
     align_mask: torch.Tensor | None = None  # (B, T) 1 where a description exists
     # Hindsight goals: embedding of what was actually achieved after step t
     goal_targets: torch.Tensor | None = None  # (B, T, d_model)
+    # 同一件事的多热形式：(B, T, vocab)。乘上短语嵌入表就得到 goal_targets。
+    # 分开存是因为那张表在模型上，取数 worker 里没有。
+    hindsight: torch.Tensor | None = None
     goal_mask: torch.Tensor | None = None  # (B, T) 1 where something was achieved
     # Language head supervision (token ids of the written-out summary)
     language_targets: torch.Tensor | None = None  # (B, T) long, -100 to ignore

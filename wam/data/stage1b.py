@@ -50,10 +50,10 @@ def _load_window_1b(job: tuple) -> tuple:
     frames = read_meta(meta_shard, meta_idx, start, seq_len * k)
     if len(frames) < seq_len * k:
         raise ValueError("meta_info 帧数不足")
-    ids, targets, flags = window_events(
+    ids, targets, flags, hind = window_events(
         frames, _CTX["key_to_id"], seq_len, k,
         cfg.event.n_event_tokens, cfg.event.vocab_size, is_last)
-    return pixels, buttons, camera, hotbar, ids, targets, flags
+    return pixels, buttons, camera, hotbar, ids, targets, flags, hind
 
 
 class Stage1bData:
@@ -149,6 +149,9 @@ class Stage1bData:
             event_ids=st(4),
             event_targets=st(5),
             flags=st(6),
+            # hindsight 多热。转成 goal 空间的向量要用短语嵌入表，那张表在
+            # 模型上（GPU），所以留到训练循环里做一次矩阵乘，worker 保持轻量。
+            hindsight=st(7),
         ), labels
 
     def close(self) -> None:

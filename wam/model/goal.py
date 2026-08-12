@@ -34,12 +34,39 @@ class GoalEncoder(nn.Module):
         out = self.null_goal.expand(batch_size, -1, -1)
         return out.to(device=device or out.device, dtype=dtype or out.dtype)
 
-    def from_text(self, backbone, texts: list[str]) -> torch.Tensor:
+    def from_text(self, backbone, texts: list[str], contextual: bool = False) -> torch.Tensor:
         """(B strings) -> (B, n_goal_tokens, d).
 
-        Uses the backbone's own input embeddings, keeping per-token structure
-        rather than mean-pooling: "chop oak wood" is already about as many tokens
-        as the slot holds, and the ordering is information.
+        ``contextual=True`` 让指令**真的过一遍主干**，取最后一层隐状态；
+        ``False`` 是原来的行为：只查输入嵌入表。
+
+        原来那条路是这个模块的中心断点。它只调用 ``get_input_embeddings()``，
+        也就是说 **28 层 transformer 在编码指令时一次都没被用到** —— goal 向量
+        本质是一袋 token 嵌入，没有任何语义组合。实测后果：
+
+        * 训练时没见过的同义句只有 18% 迁移成功（随机猜 12.5%）。
+          "go straight ahead" 触发不了任何动作，因为它和 "move forward"
+          一个 token 都不共享；而 "dig the block ahead" 成功，是因为它和
+          "mine the block in front" 共享 ``the`` ``block`` —— 词面重叠，不是语义。
+        * 八个随机向量与真实文本嵌入打平（1.2501 vs 1.2266）。
+        * 换 3 倍大的主干毫无改善（1.2559 vs 1.2266）—— 更大的 LLM 不改变查表行为。
+
+        —— 以上是修改前的诊断。**实测证明这个诊断是错的，所以默认值仍是 False。**
+
+        把指令真的过一遍主干（``contextual=True``）重训一轮 20,000 步之后：
+
+        * 同义句命中率 **23% -> 18%**，比不过主干还差；
+        * 连训练见过的指令都退化了：``jump`` 从 0.90 掉到 0.33，
+          ``turn left`` / ``strafe right`` 的按键几乎归零；
+        * 无关句子反而开始触发强动作：``eat a sandwich`` -> ``attack=0.63``。
+
+        推测：过主干后八个短句的最后一层表示被通用句法特征主导，彼此**更相似**
+        而非更可分，于是连"区分八个类"这件本来轻松的事都变难了。
+
+        真正的根因更可能在训练信号而非编码方式：用**八个固定类别**训练，goal 空间
+        只需要八个可区分的点，无论向量怎么来，模型都只会学查表 —— 目标函数从未
+        要求它泛化。改变这一点要靠 hindsight goals（目标变成连续的"实际达成了什么"），
+        不是靠换编码器。详见 docs/stage1b-log.md。
         """
         if backbone.tokenizer is None:
             raise RuntimeError("external goals need a tokenizer; backbone.model_name is 'random'")
@@ -51,6 +78,9 @@ class GoalEncoder(nn.Module):
                 continue
             ids = backbone.tokenizer(text, add_special_tokens=False, return_tensors="pt")
             vectors = emb(ids["input_ids"].to(emb.weight.device))[0]  # (L, d)
+            if contextual:
+                hidden, _ = backbone(vectors.unsqueeze(0).to(backbone.dtype))
+                vectors = hidden[0].to(self.null_goal.dtype)
             rows.append(self._fit(vectors))
         return torch.stack(rows)
 

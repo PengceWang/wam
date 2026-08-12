@@ -70,6 +70,47 @@ def read_meta(shard: str, episode_idx: int, start: int, n: int) -> list[dict]:
 
 
 @torch.no_grad()
+def phrase_embedding_table(model, concepts_path: str | Path, device,
+                           center: bool = True) -> torch.Tensor:
+    """(vocab_size, d_model)：每个概念 id 对应的 LLM 短语嵌入。
+
+    ``center=True`` 会减去全局均值，**这对 hindsight 目标是必需的**。
+
+    LLM 的隐状态有各向异性：所有向量挤在一个很窄的锥里。实测这 1,023 个短语
+    两两余弦都在 0.89~0.97 之间，按活动类型分组后同类 0.950 / 异类 0.913，
+    只差 **0.037** —— 余弦损失在这样的目标上几乎没有信号，模型只要输出那个
+    公共方向就能拿到 0.93，根本学不到"目标是什么"。（现象上就是 goal 损失
+    100 步内从 1.03 掉到 0.07，掉得可疑地快。）
+
+    减去全局均值之后：同类 0.511 / 异类 0.098，差 **0.413**，分离度提高 11 倍。
+    矩阵也变得有意义了 —— 砍树↔杀怪 -0.042（几乎正交），挖石头↔挖矿 0.276
+    （都属采矿）。
+
+    ``seed_concept_embeddings`` 那边**不做中心化**：它只是 ``EventEmbedding``
+    的初值，之后还要被梯度继续训练，而且事件预测走的是 BCE 不是余弦，
+    实测未中心化就能拿到 mAP 0.647。不去动一个已经验证有效的东西。
+    """
+    import json
+
+    raw = json.loads(Path(concepts_path).read_text(encoding="utf-8"))
+    id_to_phrase = {int(v): k for k, v in raw["phrases"].items()}
+    backbone = model.backbone
+    d = model.d_model
+    table = torch.zeros(model.cfg.event.vocab_size, d, device=device)
+    if backbone.tokenizer is None:
+        return table
+    for cid, phrase in sorted(id_to_phrase.items()):
+        tok = backbone.tokenizer(phrase, add_special_tokens=False, return_tensors="pt")
+        emb = backbone.get_input_embeddings()(tok["input_ids"].to(device))
+        hidden, _ = backbone(emb.to(backbone.dtype))
+        table[cid] = hidden[0].float().mean(dim=0)
+    if center:
+        live = table.norm(dim=-1) > 0
+        table[live] = table[live] - table[live].mean(0, keepdim=True)
+    return table
+
+
+@torch.no_grad()
 def seed_concept_embeddings(model, concepts_path: str | Path, device) -> int:
     """把概念行从「随机初始化」换成「LLM 对该短语的理解」。
 
@@ -117,16 +158,22 @@ def window_events(
     n_event_tokens: int,
     vocab_size: int,
     is_last_window: bool,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """逐帧 meta_info -> (event_ids, event_targets, flags)。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """逐帧 meta_info -> (event_ids, event_targets, flags, hindsight)。
 
     ``event_ids[t]``      第 t 步观察到的概念（进入序列的输入 token）
     ``event_targets[t]``  第 t+1 步会发生什么（world head 的多标签目标）
     ``flags[t]``          第 t+1 步的世界标志
+    ``hindsight[t]``      第 t+1 步到窗口末尾之间**实际达成了什么**（多热）。
+
+    hindsight 是「事后重标注」的原料：任何一条轨迹都是「到达它最终所处状态」的
+    成功示范，所以不需要人工编写目标标签 —— 事件流已经说明了达成了什么。
+    这也是为什么它必须排在事件管道之后：没有事件，「达成了什么」根本无从定义。
     """
     ids = np.zeros((seq_len, n_event_tokens), dtype=np.int64)
     targets = np.zeros((seq_len, vocab_size), dtype=np.float32)
     flags = np.zeros((seq_len, len(FLAGS)), dtype=np.float32)
+    hind = np.zeros((seq_len, vocab_size), dtype=np.float32)
 
     per_step: list[list[int]] = []
     mined: list[bool] = []
@@ -165,4 +212,8 @@ def window_events(
         else:
             # 最后一步没有"下一步"可看；done 只有在这确实是本集最后一个窗口时才为真
             flags[t, 4] = float(is_last_window)
-    return ids, targets, flags
+        # 从 t+1 到窗口末尾，累计实际发生过的一切
+        for u in range(t + 1, seq_len):
+            for cid in per_step[u]:
+                hind[t, cid] = 1.0
+    return ids, targets, flags, hind

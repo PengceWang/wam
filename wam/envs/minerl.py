@@ -68,6 +68,13 @@ class ConceptVocab:
         self.phrases: dict[str, int] = {}
         if self.path is not None and self.path.exists():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # 两种格式都接受：
+            #   {短语: id}                    —— 这个类自己 save() 出来的
+            #   {"phrases": {短语: id}, ...}  —— scripts/build_concept_vocab.py 产出的
+            # 后者必须能读，否则实时环境会重新分配 id，而离线训练学到的概念嵌入
+            # 是按离线 id 排的 —— 同一个 id 在两边指向不同的概念，静默错位。
+            if isinstance(raw.get("phrases"), dict):
+                raw = raw["phrases"]
             self.phrases = {k: int(v) for k, v in raw.items()}
         # Concepts seen after the vocabulary filled up, kept for reporting.
         self.overflow: set[str] = set()
