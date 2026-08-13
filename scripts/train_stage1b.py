@@ -59,6 +59,12 @@ def main() -> int:
     ap.add_argument("--event-weight", type=float, default=1.0)
     ap.add_argument("--flag-weight", type=float, default=1.0)
     ap.add_argument("--latent-weight", type=float, default=0.5)
+    ap.add_argument("--goal-cond-prob", type=float, default=0.0,
+                    help="以这个概率把 hindsight 目标**放进 goal 槽**，让 actor 学会"
+                         "以它为条件行动。这是 hindsight replay 缺掉的另一半：只训 GoalHead "
+                         "产出目标向量，actor 却从没以这种形状的目标为输入训练过，"
+                         "实测注入目标完全无法改变行为（注入「木头」得到 0.4 次木头事件，"
+                         "和注入「泥土」、和不注入完全一样）。")
     ap.add_argument("--goal-weight", type=float, default=0.0,
                     help="事后重标注（hindsight goals）的权重。>0 时把「接下来实际达成了"
                          "什么」当作「它本来的目标」，让 goal 空间以结果为坐标，而不是"
@@ -133,6 +139,16 @@ def main() -> int:
         # 架构上就是为这个交接设计的。
         null = model.goal_encoder.null(1, device=device, dtype=goal_table.dtype)
         goal = torch.stack([goal_table[l] if l >= 0 else null[0] for l in labels])
+
+        if args.goal_cond_prob > 0 and phrase_emb is not None and batch.hindsight is not None:
+            # 目标条件化的行为克隆：告诉模型「你接下来会达成 X」，让它预测那些
+            # 真的达成了 X 的动作。hindsight[:, 0] 是整个窗口内达成的一切。
+            h0 = batch.hindsight[:, 0].float()
+            n0 = h0.sum(-1, keepdim=True)
+            tgt0 = (h0 @ phrase_emb) / n0.clamp(min=1.0)
+            use = (torch.rand(b, device=device) < args.goal_cond_prob) & (n0.squeeze(-1) > 0)
+            repl = tgt0.unsqueeze(1).expand(-1, cfg.heads.n_goal_tokens, -1).to(goal.dtype)
+            goal = torch.where(use[:, None, None], repl, goal)
         state = model.initial_state(b, device=device)
         state = type(state)(memory=state.memory, prev_action=state.prev_action,
                             goal=goal, goal_is_external=True)

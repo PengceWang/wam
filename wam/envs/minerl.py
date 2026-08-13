@@ -66,6 +66,7 @@ class ConceptVocab:
         self.size = size
         self.path = Path(path) if path else None
         self.phrases: dict[str, int] = {}
+        self._extra: dict = {}
         if self.path is not None and self.path.exists():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             # 两种格式都接受：
@@ -74,6 +75,10 @@ class ConceptVocab:
             # 后者必须能读，否则实时环境会重新分配 id，而离线训练学到的概念嵌入
             # 是按离线 id 排的 —— 同一个 id 在两边指向不同的概念，静默错位。
             if isinstance(raw.get("phrases"), dict):
+                # 保留外层的其它字段。save() 会原样写回 —— 否则一次 env.close()
+                # 就把 build_concept_vocab.py 产出的 key_to_id 抹掉，
+                # 而那张表是数据层把游戏事件映射到概念 id 的唯一依据。
+                self._extra = {k: v for k, v in raw.items() if k != "phrases"}
                 raw = raw["phrases"]
             self.phrases = {k: int(v) for k, v in raw.items()}
         # Concepts seen after the vocabulary filled up, kept for reporting.
@@ -95,7 +100,10 @@ class ConceptVocab:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.phrases, indent=2, sort_keys=True), encoding="utf-8")
+        # 读进来是什么形状，写回去就是什么形状。读的是带 key_to_id 的包装格式时，
+        # 直接写扁会静默丢掉那张映射表。
+        blob = {"phrases": self.phrases, **self._extra} if self._extra else self.phrases
+        self.path.write_text(json.dumps(blob, indent=2, sort_keys=True), encoding="utf-8")
 
     def id_to_phrase(self) -> dict[int, str]:
         """The table ``EventEmbedding.init_from_text`` is initialised from."""
