@@ -59,6 +59,11 @@ def main() -> int:
     ap.add_argument("--event-weight", type=float, default=1.0)
     ap.add_argument("--flag-weight", type=float, default=1.0)
     ap.add_argument("--latent-weight", type=float, default=0.5)
+    ap.add_argument("--clusters", default=None,
+                    help="scripts/cluster_concepts.py 产出的活动类。给了就把 hindsight "
+                         "目标**离散化**成「窗口内占优的活动类」的原型向量，而不是所有"
+                         "达成概念的连续平均。实测指令目标（8 个离散类）能驱动行为而"
+                         "连续 hindsight 目标不能 —— 区别在形式不在带宽。")
     ap.add_argument("--goal-cond-prob", type=float, default=0.0,
                     help="以这个概率把 hindsight 目标**放进 goal 槽**，让 actor 学会"
                          "以它为条件行动。这是 hindsight replay 缺掉的另一半：只训 GoalHead "
@@ -110,6 +115,19 @@ def main() -> int:
     n_seed = seed_concept_embeddings(model, args.concepts, device)
     print(f"用 LLM 短语嵌入初始化了 {n_seed:,} 个概念行（init_from_text，此前从未被调用）")
 
+    cluster_onehot = centroids = None
+    if args.clusters:
+        import numpy as _np
+
+        z = _np.load(args.clusters)
+        co = torch.from_numpy(z["cluster_of"]).to(device)          # (vocab,) -1 = PAD
+        k = int(z["k"])
+        cluster_onehot = torch.zeros(len(co), k, device=device)
+        m = co >= 0
+        cluster_onehot[m] = torch.nn.functional.one_hot(co[m], k).float()
+        centroids = torch.from_numpy(z["centroids"]).to(device).float()
+        print(f"活动类 {k} 个（hindsight 目标离散化为类原型）")
+
     phrase_emb = None
     if args.goal_weight > 0:
         from wam.data.events import phrase_embedding_table
@@ -145,7 +163,10 @@ def main() -> int:
             # 真的达成了 X 的动作。hindsight[:, 0] 是整个窗口内达成的一切。
             h0 = batch.hindsight[:, 0].float()
             n0 = h0.sum(-1, keepdim=True)
-            tgt0 = (h0 @ phrase_emb) / n0.clamp(min=1.0)
+            if centroids is not None:
+                tgt0 = centroids[(h0 @ cluster_onehot).argmax(-1)]
+            else:
+                tgt0 = (h0 @ phrase_emb) / n0.clamp(min=1.0)
             use = (torch.rand(b, device=device) < args.goal_cond_prob) & (n0.squeeze(-1) > 0)
             repl = tgt0.unsqueeze(1).expand(-1, cfg.heads.n_goal_tokens, -1).to(goal.dtype)
             goal = torch.where(use[:, None, None], repl, goal)
@@ -183,7 +204,14 @@ def main() -> int:
             # 「达成」，对着空集编一个目标是噪声。
             h = batch.hindsight.float()
             n = h.sum(-1, keepdim=True)
-            tgt = (h @ phrase_emb) / n.clamp(min=1.0)
+            if centroids is not None:
+                # 离散化：数出每个活动类被达成了几个概念，取占优的那一类的原型。
+                # 目标从"几百种组合的连续平均"变成"16 选 1"，边界清晰 ——
+                # 这正是指令目标能驱动而连续目标不能的那个差别。
+                counts = h @ cluster_onehot                  # (B, T, k)
+                tgt = centroids[counts.argmax(-1)]           # (B, T, d)
+            else:
+                tgt = (h @ phrase_emb) / n.clamp(min=1.0)
             gmask = (n.squeeze(-1) > 0).float()
             g = goal_loss(out.goal, tgt, gmask)
             loss = loss + args.goal_weight * g
