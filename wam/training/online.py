@@ -151,6 +151,26 @@ def detach_state(state):
                    goal=d(state.goal), goal_is_external=d(state.goal_is_external))
 
 
+def free_cache(state):
+    """把 KV cache 里的张量**就地清空**，不依赖引用计数。
+
+    实测教训：采集完把 ``cache=None`` 塞进一个新 state，``memory_allocated``
+    纹丝不动（前后都是 20.32 GB）—— 丢引用不等于释放，那个 Cache 对象还被别处
+    持有着。12 环境 × 150 步的 cache 约 14 GB，它要是活到反传阶段就会和更新的
+    峰值叠在一起，必 OOM。这里直接把 layer.keys/values 置空，谁持有都没用。
+    """
+    cache = getattr(state, "cache", None)
+    if cache is None:
+        return
+    for attr in ("key_cache", "value_cache"):
+        if hasattr(cache, attr):
+            setattr(cache, attr, [])
+    for layer in getattr(cache, "layers", []) or []:
+        for attr in ("keys", "values"):
+            if getattr(layer, attr, None) is not None:
+                setattr(layer, attr, None)
+
+
 def ppo_update(model, ref_logits_fn, opt, cfg: PPOConfig, chunks: list[dict]) -> dict:
     """在长视野轨迹上做 PPO 更新。
 

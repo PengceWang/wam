@@ -25,6 +25,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+_DBG = bool(__import__("os").environ.get("WAM_DEBUG_MEM"))
+
+
+def _mem(tag):
+    if _DBG:
+        print(f"  [mem] {tag:<26} {torch.cuda.memory_allocated()/2**30:6.2f} GB "
+              f"(峰值 {torch.cuda.max_memory_allocated()/2**30:6.2f})", flush=True)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
@@ -114,7 +122,8 @@ def main() -> int:
     from wam.config import WAMConfig
     from wam.model.action import ActionChunk
     from wam.model.wam import WorldActionModel
-    from wam.training.online import PPOConfig, chunk_log_prob, gae, ppo_update
+    from wam.training.online import (PPOConfig, chunk_log_prob, free_cache, gae,
+                                     ppo_update)
 
     blob = torch.load(args.init_from, map_location="cpu", weights_only=False)
     cfg = WAMConfig.from_dict(blob["config"])
@@ -132,11 +141,30 @@ def main() -> int:
         p.start()
         conns.append(parent)
         procs.append(p)
+    # 启动会偶发超时（Minecraft 起 JVM + Mesa 软件渲染，12 个并发时更容易撞上）。
+    # 无人值守跑 12 小时，不能因为一个环境没起来就整轮退出 —— 换个种子重试。
+    seed_next = [N]
     frames = []
     for i, c in enumerate(conns):
         f = c.recv()
-        if isinstance(f[0], str) and f[0] == "ERROR":
-            print(f"环境 {i} 启动失败: {f[1]}\n{f[2]}")
+        for attempt in range(3):
+            if not (isinstance(f[0], str) and f[0] == "ERROR"):
+                break
+            print(f"环境 {i} 启动失败({attempt+1}/3): {f[1]}，换种子 {seed_next[0]} 重试",
+                  flush=True)
+            try:
+                procs[i].terminate()
+                procs[i].join(timeout=10)
+            except Exception:
+                pass
+            parent, child = ctx.Pipe()
+            pr = ctx.Process(target=_boot, args=(child, seed_next[0], cfg.to_dict()), daemon=True)
+            seed_next[0] += 1
+            pr.start()
+            conns[i], procs[i] = parent, pr
+            f = parent.recv()
+        else:
+            print(f"环境 {i} 三次都起不来，放弃：{f[1]}", flush=True)
             return 1
         frames.append(f)
     print(f"{N} 个环境就绪", flush=True)
@@ -182,8 +210,6 @@ def main() -> int:
                 fr[i] = last_good[i]
                 fails[i] += 1
         return fr
-
-    seed_next = [N]
 
     def restart(i, why="异常"):
         print(f"  环境 {i} {why}，重启（新种子 {seed_next[0]}）", flush=True)
@@ -326,10 +352,13 @@ def main() -> int:
                 v_last = model.value_head.expectation(v_last)
             # 采集完立刻扔掉 KV cache。150 步 × 12 环境 ≈ 16 GB，它要是活到
             # 反传阶段就和更新的显存叠在一起，必 OOM。memory 槽位要留着传给下一轮。
+            _mem("采集结束")
             del out_last
+            free_cache(st)          # 置 None 不够，必须就地清空，见 online.py
             st = type(st)(memory=st.memory.detach(), prev_action=st.prev_action,
                           goal=st.goal, goal_is_external=st.goal_is_external, cache=None)
             torch.cuda.empty_cache()
+            _mem("释放采集 cache 后")
 
         stack = lambda xs: torch.stack(xs, dim=1)                       # noqa: E731
         rewards = stack(R)
@@ -340,6 +369,9 @@ def main() -> int:
         px_all, ev_all = stack(P), stack(E)
         ab, ac, ah = stack(A_b), stack(A_c), stack(A_h)
         lp_all = stack(LP).detach()
+        # stack 会复制一份，原列表还占着同样大小 —— pixels 尤其明显（每份 1.1 GB）
+        del P, E, A_b, A_c, A_h, LP, V, R
+        _mem("stack 完 + 释放列表")
         adv, returns = adv.detach(), returns.detach()
 
         def slice_state(s0, lo, hi):
@@ -370,6 +402,7 @@ def main() -> int:
         t_roll += time.time() - _t
         _t = time.time()
         logs = ppo_update(model, ref_logits_fn, opt, ppo, chunks)
+        _mem("ppo_update 后")
         t_upd += time.time() - _t
         state = type(state)(memory=st.memory.detach(), prev_action=st.prev_action,
                             goal=st.goal, goal_is_external=st.goal_is_external, cache=None)
