@@ -327,8 +327,14 @@ def main() -> int:
                         frames.append(last_good[i])
                         continue
                     try:
+                        # **必须带超时。** worker 死掉会抛 EOFError，但 worker *卡住*
+                        # 什么都不抛 —— recv() 会永远阻塞，整轮无人值守训练就这么挂着，
+                        # 而 CPU 占用看起来还很正常，从外面完全看不出来。
+                        # Minecraft 一步约 0.4 秒，30 秒还没回就是真出事了。
+                        if not conn.poll(30):
+                            raise TimeoutError("worker 无响应")
                         frames.append(conn.recv())
-                    except (EOFError, OSError):
+                    except (EOFError, OSError, TimeoutError):
                         frames.append(last_good[i])
                         fails[i] += 1
                 frames = sanitize(frames)

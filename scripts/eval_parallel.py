@@ -39,8 +39,13 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=500)
     ap.add_argument("--seed0", type=int, default=300, help="留出的评测种子，训练用 0..N")
     ap.add_argument("--tag", default="")
-    ap.add_argument("--cache-reset", type=int, default=8,
-                    help="每这么多步清一次 KV cache，0 = 永不清。"
+    ap.add_argument("--cache-reset", type=int, default=150,
+                    help="每这么多步清一次 KV cache，0 = 永不清。**默认 150 = 训练的"
+                         "horizon**，两个理由缺一不可：(1) 训练每轮更新后 cache 就清了，"
+                         "策略见过的最长上下文就是 150 步，评测再长就是分布外；"
+                         "(2) reset=0 跑 500 步的 cache 要约 50 GB，直接 OOM。"
+                         "默认曾经是 8 —— 那会让原木事件归零（8/16/32 三档共 5400 步"
+                         "全是 0），整张评测表会假阴性，等于白跑一夜。"
                          "注意实际上下文是**锯齿形**的：清完只剩 1 个时间步，"
                          "涨到 N 再归零，均值 (N+1)/2。")
     ap.add_argument("--keep-cache", action="store_true",
@@ -115,8 +120,13 @@ def main() -> int:
                     new.append(last_good[i])
                     continue
                 try:
+                    # 和 train_online.py 同样的坑：worker **死掉**会抛 EOFError，
+                    # 但 worker **卡住**什么都不抛，recv() 会永远阻塞。这次就是
+                    # 一次评测跑了 23 分钟没动静，而 CPU 占用看着完全正常。
+                    if not conn.poll(30):
+                        raise TimeoutError("worker 无响应")
                     f = conn.recv()
-                except (EOFError, OSError):
+                except (EOFError, OSError, TimeoutError):
                     f = last_good[i]
                 if isinstance(f[0], np.ndarray) and f[0].shape == shape0:
                     last_good[i] = f
