@@ -29,10 +29,36 @@ class GoalEncoder(nn.Module):
         # rather than zeros, so "no goal" is a state the model can represent
         # instead of an absence it has to infer from a dead input.
         self.null_goal = nn.Parameter(torch.randn(n_goal_tokens, d_model) * 0.02)
+        # 视觉目标通道。沿用 vision.py 里 Perceiver resampler 的同一套写法：
+        # n_goal_tokens 个学出来的 query 去注意视觉 token。
+        self.visual_query = nn.Parameter(torch.randn(1, n_goal_tokens, d_model) * 0.02)
+        self.visual_pool = nn.MultiheadAttention(d_model, 8, batch_first=True)
+        self.visual_norm = nn.LayerNorm(d_model)
 
     def null(self, batch_size: int, device=None, dtype=None) -> torch.Tensor:
         out = self.null_goal.expand(batch_size, -1, -1)
         return out.to(device=device or out.device, dtype=dtype or out.dtype)
+
+    def from_visual(self, visual: torch.Tensor) -> torch.Tensor:
+        """(B, W, n_visual_tokens, d) 一段窗口的视觉潜变量 -> (B, n_goal_tokens, d)。
+
+        **这是对 from_text 的替代，不是补充。** 我们自己测过 from_text 是一袋
+        token 嵌入、语义为零：同义句迁移 18-23%（随机猜 12.5%），八个随机向量
+        与真实文本嵌入打平（1.2501 vs 1.2266），换 3 倍大的主干毫无改善。
+        文献侧的结论一致 —— STEVE-1 的消融显示，用视觉嵌入做目标空间、
+        再单独训一个文本→视觉的 prior，比直接用文本嵌入更好。
+
+        为什么视觉目标对**迁移到现实世界**是必要的，而不只是更好用：
+        当前奖励读的是 Minecraft 的 ``info["inventory"]``，现实世界没有这个 API。
+        而"目标 = 成功时世界看起来什么样"的视觉编码，任何一个摄像头都能产出。
+
+        用窗口而不是单帧：单帧只能表达"世界什么样"，一段窗口才能表达
+        "正在发生什么"。MineCLIP 的目标嵌入同样是 16 帧的视频嵌入，不是单帧。
+        """
+        q = self.visual_query.expand(visual.shape[0], -1, -1).to(visual.dtype)
+        kv = visual.mean(dim=1)                       # 窗口内平均 -> (B, N_v, d)
+        out, _ = self.visual_pool(q, kv, kv, need_weights=False)
+        return self.visual_norm(out)
 
     def from_text(self, backbone, texts: list[str], contextual: bool = False) -> torch.Tensor:
         """(B strings) -> (B, n_goal_tokens, d).

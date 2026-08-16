@@ -110,6 +110,31 @@ def reward_of(task: Task, inv_before: dict, inv_after: dict,
 # 目标采样与后见之明重标注
 # --------------------------------------------------------------------------
 
+def packed_hindsight_goals(T: int, rng: np.random.Generator,
+                           min_btwn: int = 15, max_btwn: int = 200) -> np.ndarray:
+    """给 T 个时间步分配**变长的连续目标区间**，返回每步的目标锚点下标。
+
+    从第 0 步开始，反复"当前位置 + 一个 [min_btwn, max_btwn] 的随机数"取锚点；
+    区间 ``(上一个锚点, 这个锚点]`` 内所有步的目标，都设成**这个锚点处的状态**。
+
+    为什么必须变长、必须连续 —— 这是我们上一版和 STEVE-1 的关键差距。
+    上一版是 150 步整段贴一个目标（``achieved_tasks`` 扫全段取第一个达成的任务）。
+    那样只教会"这一大段最后达成了什么"，教不会**哪些动作导致哪个状态**。
+    变长区间让同一批数据里同时有 15 步的短程映射和 200 步的长程映射，
+    模型才能学到"目标有多远"这个维度。
+
+    区间上界 200 步不是拍的：一个模型步 0.4 秒，200 步 = 80 秒，
+    和我们实测"找到并砍到一棵树"的耗时同量级。
+    """
+    idx = np.zeros(T, dtype=np.int64)
+    lo = 0
+    while lo < T:
+        hi = min(T - 1, lo + int(rng.integers(min_btwn, max_btwn + 1)))
+        idx[lo:hi + 1] = hi
+        lo = hi + 1
+    return idx
+
+
 def sample_goals(n: int, rng: np.random.Generator) -> list[Task]:
     """每个环境独立采一个任务。
 
@@ -183,6 +208,25 @@ def sil_loss(logits: dict, actions: ActionChunk, weight: torch.Tensor) -> torch.
     """
     lp, _ = chunk_log_prob(logits, actions)
     return -(lp * weight).sum() / weight.sum().clamp(min=1.0)
+
+
+# 训练时以这个概率把目标换成 null，推理时才能做 classifier-free guidance。
+# **这是 STEVE-1 里最大的单项杠杆**：CFG 让"挖泥土"提升 7.5 倍、"砍木头" 15 倍。
+# 我上一版只做了 goal_sensitivity 这个**指标**去观察目标有没有被用上 ——
+# 那是温度计，这才是发动机。
+GOAL_DROPOUT_P = 0.1
+
+
+def cfg_logits(cond: dict, uncond: dict, lam: float = 3.0) -> dict:
+    """classifier-free guidance：把"有目标"相对"无目标"的差外推出去。
+
+        logits = (1 + λ) · f(o, g) − λ · f(o)
+
+    λ=0 就是普通的条件策略。STEVE-1 的图 5 显示 λ>0 带来的提升是数量级的，
+    这也解释了为什么"模型看起来在无视目标"—— 条件信号本来就弱，
+    需要在推理时放大，而不是指望它在训练里自己变强。
+    """
+    return {k: (1.0 + lam) * cond[k].float() - lam * uncond[k].float() for k in cond}
 
 
 def goal_sensitivity(model, out_readout, goal_shuffled_readout) -> torch.Tensor:
