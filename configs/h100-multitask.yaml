@@ -1,0 +1,85 @@
+# 多任务在线 RL，面向 2×H100 80GB。
+#
+# qwen3-0.6b.yaml 是给 12GB 的 RTX 3060 调的（它自己的注释就写着
+# "The readme's 2x RTX 6000 Ada budget would let you raise seq_len to 32-64"）。
+# 在 80GB 上有两个数没有理由再保守：
+#
+#   seq_len 8   —— 砍断一根原木要连续 7.5 个模型步，8 步的训练窗口里
+#                  **几乎不可能出现一次完整的砍树**。这大概率就是 BC 只有
+#                  6.1% 原木/挖掘的原因。见 docs/online-rl-log.md §3。
+#   n_trainable_top_layers 0
+#               —— 596M 的 LLM 全程冻结，可训练只有 176M / 865M (20%)。
+#
+# 显存怎么估：BC 训练是 batch × seq^2（注意力矩阵；sdpa 在"带 mask + 长 KV
+# cache"这条路径上退回 math 后端把它存下来，强制 EFFICIENT_ATTENTION 会报
+# "No available kernel"）。47GB 卡实测 batch4×seq32 OOM、batch2×seq32 用
+# 33.6GB。80GB 按同比例：batch4×seq32 或 batch1×seq64 放得下。
+# 装 flash-attn 能从根上去掉这一项，之后可以再放开一档。
+backbone:
+  model_name: Qwen/Qwen3-1.7B
+  dtype: bfloat16
+  attn_implementation: sdpa
+  # Must stay false: transformers disables the KV cache under checkpointing, and
+  # the rollout in WorldActionModel.step() carries history through that cache.
+  # Lower train.seq_len / batch_size instead if VRAM is tight.
+  gradient_checkpointing: false
+  n_trainable_top_layers: 14       # 解冻上半部分。0 = 冻死，28 = 全开。
+
+vision:
+  encoder_name: google/siglip-base-patch16-224
+  image_size: 224
+  n_visual_tokens: 16
+  resampler_depth: 2
+  resampler_heads: 8
+  freeze_encoder: true
+
+memory:
+  n_scene: 16
+  n_world: 16
+  n_skill: 8
+  n_drive: 8
+
+action:
+  chunk_size: 8
+  camera_bins: 21
+  camera_max_delta: 20.0
+  camera_mu: 40.0
+  n_hotbar: 9
+  n_action_tokens: 4
+
+event:
+  n_event_tokens: 8
+  vocab_size: 1024
+
+heads:
+  hidden_mult: 2
+  n_goal_tokens: 4
+  value_bins: 1
+
+loss:
+  next_latent: 1.0
+  event: 1.0
+  actor: 1.0
+  value: 0.5
+  goal: 0.1
+  language: 0.1
+  align: 1.0
+  prior_retention: 0.1   # only active from stage 3
+
+# Measured on the RTX 3060 (12GB), stage 1, bf16:
+#   batch 1 x seq  8  ->  1.7 s/step,  3.7 GiB
+#   batch 1 x seq 16  ->  3.3 s/step,  6.2 GiB   <- default
+#   batch 2 x seq 16  ->  8.7 s/step, 10.5 GiB   (too close to the limit)
+# The rollout is sequential over timesteps, so cost scales ~linearly in seq_len.
+train:
+  stage: 1
+  seq_len: 32            # > 7.5 步（砍断一根原木所需），8 步窗口装不下一次完整砍树
+  batch_size: 4
+  lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 20000
+  log_every: 20
+  device: cuda
+  seed: 0

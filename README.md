@@ -45,6 +45,47 @@ Full structure, including which parts are dormant:
 The stage-1a question — *does an instruction in the goal slot reach the action
 head?* — is answered yes. Everything downstream of that is early.
 
+## What online RL actually did
+
+The most load-bearing results in this repo are negative ones, so they are stated
+before anything else. Full record: [docs/online-rl-log.md](docs/online-rl-log.md).
+
+**Context length is a capability floor, not a memory knob.** Same weights, same
+seeds, only the KV-cache reset interval changed:
+
+| reset every | 8 | 16 | 32 | 64 | never |
+| --- | --- | --- | --- | --- | --- |
+| logs / 1000 steps | **0** | **0** | **0** | 1.11 | **5.00** |
+
+Fast blocks (grass, dirt, leaves — one step each) are unaffected. Only logs
+(~3 s ≈ 7.5 model steps) go to zero. An agent whose context is cut every 8 steps
+**cannot finish chopping a tree**, and PPO was updating in 8-step segments.
+Note that BC trained at `seq_len=8`, so its training windows almost never
+contained a complete chop either.
+
+**Single-task RL changed behaviour, but not the target behaviour.** 6000 steps
+per checkpoint on held-out seeds:
+
+| checkpoint | mined | logs | **logs / mined** |
+| --- | --- | --- | --- |
+| BC start | 198 | 12 | **6.1%** |
+| U25 | 373 | 24 | **6.4%** |
+| U100 | 356 | 18 | **5.1%** |
+
+Mining doubled — 7.3σ, p < 1e-12, the online loop demonstrably works. But the
+**ratio never moved**. The extra activity was `mined dirt`, `mined grass block`.
+Reward went only to logs; what was learned was "hold attack". Under a single
+task every rewarded trajectory shares one common component, and diffuse credit
+(γ=0.999, λ=0.98 over 150 steps) converges to exactly that component.
+
+That is what [docs/multitask-design.md](docs/multitask-design.md) is built to fix.
+
+**Judge by ratios, not counts.** An earlier round of four experiments was
+concluded on evaluations of 900 steps in which the BC baseline scored **2 log
+events total** (`0,0,2,0,0,0` across six episodes). Those conclusions were
+Poisson noise and have been withdrawn. Evaluation is now 12 envs × 500 steps and
+reports absolute counts so that "2 in total" cannot hide inside a mean.
+
 ## Install
 
 Linux only for the simulator (JDK 8 + MCP-Reborn). On Windows this means WSL2;
@@ -73,6 +114,16 @@ python scripts/smoke_test.py
 # play it yourself in a browser, or hand an instruction to the model
 python scripts/play_server.py --checkpoint ~/stage1a_run1.pt   # → localhost:8080
 
+# multi-task goal-conditioned online RL (2x H100: one run per card, no DDP)
+CUDA_VISIBLE_DEVICES=0 python scripts/train_multitask.py \
+    --config configs/h100-multitask.yaml --init-from CKPT --envs 16 --tag A
+
+# evaluate: 12 envs x 500 steps, absolute counts, ratio is the criterion
+python scripts/eval_parallel.py --ckpt CKPT --envs 12 --steps 500 --seed0 300
+
+# side-by-side video of two checkpoints in the same world, same RNG
+python scripts/compare_video.py --ckpts a b --labels A B --seeds 300
+
 # stage 1a
 python scripts/train_stage1a.py --overfit 4 --max-steps 80     # sanity first
 python scripts/train_stage1a.py --max-steps 3000 --wandb wam-stage1a
@@ -100,6 +151,8 @@ otherwise surface after a day of training.
 | `wam/data/contractor.py` | contractor LMDB → windows, instructions derived from actions |
 | `wam/data/stage1a.py` | balanced sampling, goal token table |
 | `wam/training/losses.py` | `L = Σ λ_i L_i` |
+| `wam/training/online.py` | PPO in the live env; long-horizon GAE, cache detach vs free |
+| `wam/training/multitask.py` | tasks, base-rate-normalised reward, hindsight relabel, SIL |
 | `wam/training/eval_stage1a.py` | obedience and human-likeness, both as numbers |
 
 ## Two environments, deliberately
@@ -144,8 +197,19 @@ none of them show up in a loss curve.
   positions, with no eviction anywhere. Minecraft progress is measured in hours.
 - **Crafting is unreachable from behaviour cloning.** `inventory` is pressed in
   0.52% of contractor frames and carries ~1.3% of the actor gradient.
-- **Model sizing is unknown.** The VRAM sweep for larger backbones failed on a
-  DNS error before it measured anything.
+- **Model sizing is still unknown.** The VRAM sweep for larger backbones failed
+  on a DNS error before it measured anything. A controlled ablation is running:
+  `seq_len 8 → 32` on one card, `Qwen3-0.6B → 1.7B` on the other, each a
+  single-variable change against `stage1b_cl`, judged by logs/mined.
+- **20% of the model trains.** 596M of 865M parameters are the frozen LLM
+  (`n_trainable_top_layers: 0`). Before adding parameters, unfreeze the ones
+  that are already there — `configs/h100-multitask.yaml` sets 14.
+- **Goals are not used yet.** Every run so far passed the null goal token, so
+  the agent free-runs and the reward exists only in the weights. Goal
+  conditioning has failed three times under BC (no search in BC); the
+  multi-task RL design attacks it from the other side, with a
+  `goal_sensitivity` metric that says on update 1 whether the goal input is
+  being read at all.
 
 ## Licence and provenance
 
