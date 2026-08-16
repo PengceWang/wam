@@ -62,7 +62,7 @@ def main() -> int:
     from wam.model.action import ActionChunk
     from wam.model.wam import WorldActionModel
     from wam.training.multitask import (TASKS, MultiTaskConfig, achieved_tasks,
-                                        goal_sensitivity, normalised_reward,
+                                        goal_sensitivity, reward_of,
                                         sample_goals, sil_loss)
     from wam.training.online import chunk_log_prob, free_cache, gae
 
@@ -168,7 +168,10 @@ def main() -> int:
                              cache=None)
         P, E, A_b, A_c, A_h, LP, V, R = [], [], [], [], [], [], [], []
         ev_hist = [[] for _ in range(N)]          # 给后见之明重标注用
-        goal_hist = [list(goals)]
+        inv_prev = [dict(f[3]["inv"]) for f in frames]
+        inv_first = [dict(f[3]["inv"]) for f in frames]
+        pos_first = [f[3]["pos"] for f in frames]
+        pos_prev = list(pos_first)
         per_task = {t.key: [0.0, 0] for t in TASKS}
 
         with torch.no_grad():
@@ -179,7 +182,7 @@ def main() -> int:
                 if t and t % args.goal_every == 0:
                     goals = sample_goals(N, rng)
                     st = model.set_goal(st, [g.goal_text for g in goals])
-                    goal_hist.append(list(goals))
+
 
                 px, ev = to_batch(frames)
                 P.append(px); E.append(ev)
@@ -229,8 +232,16 @@ def main() -> int:
                 rew = []
                 for i, f in enumerate(frames):
                     ev_hist[i].append(f[2] or "")
-                    r = normalised_reward(goals[i], f[2] or "", 0.0)
+                    inv_now = f[3]["inv"]
+                    # 这一步走了多远。**上一版这里硬编码成 0.0**，等于让 travel
+                    # 的奖励恒等于零 —— 而 travel 是"多任务能拆开信用"的唯一支柱，
+                    # 整个设计的承重墙。而且 env worker 当时压根没送位置出来，
+                    # 所以那不是笔误，是根本算不出来。
+                    p0, p1 = pos_prev[i], f[3]["pos"]
+                    step_disp = ((p1[0] - p0[0]) ** 2 + (p1[2] - p0[2]) ** 2) ** 0.5
+                    r = reward_of(goals[i], inv_prev[i], inv_now, f[2] or "", step_disp)
                     rew.append(r)
+                    inv_prev[i], pos_prev[i] = dict(inv_now), p1
                     per_task[goals[i].key][0] += r
                     per_task[goals[i].key][1] += 1
                 R.append(torch.tensor(rew, device=dev, dtype=torch.float32))
@@ -261,7 +272,9 @@ def main() -> int:
         # 目标策略不再是同一个，PPO 的重要性比值就失去意义了。见 sil_loss。
         sil_w, sil_goal = torch.zeros(N, T, device=dev), [None] * N
         for i in range(N):
-            got = achieved_tasks(ev_hist[i], 0.0)
+            p0, p1 = pos_first[i], frames[i][3]["pos"]
+            net = ((p1[0]-p0[0])**2 + (p1[2]-p0[2])**2) ** 0.5   # 净位移，不是路程
+            got = achieved_tasks(inv_first[i], frames[i][3]["inv"], ev_hist[i], net)
             if got:
                 sil_goal[i] = got[0]
                 sil_w[i] = 1.0

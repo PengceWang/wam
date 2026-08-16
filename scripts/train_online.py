@@ -49,15 +49,26 @@ def env_worker(conn, seed: int, cfg_dict: dict):
 
     cfg = WAMConfig.from_dict(cfg_dict)
     env = MineRLEnv(cfg, seed=seed, vocab_path=None)
+
+    def extra(o):
+        """位置和物品栏。**位置必须送出来** —— 少了它 travel 类奖励只能恒为 0，
+        而"不需要攻击的任务"正是多任务能拆开信用的唯一理由。
+        物品栏比事件文本可靠：``mined oak log`` 和 ``picked up oak log`` 是两条
+        事件、同一根木头，按文本计数会算两分；物品栏只记你**手里有什么**。"""
+        i = o.info or {}
+        p = i.get("player_pos") or {}
+        return {"pos": (float(p.get("x", 0)), float(p.get("y", 0)), float(p.get("z", 0))),
+                "inv": {k: int(v) for k, v in (i.get("inventory") or {}).items()}}
+
     obs = env.reset()
-    conn.send((obs.rgb, obs.event_ids, ""))
+    conn.send((obs.rgb, obs.event_ids, "", extra(obs)))
     while True:
         msg = conn.recv()
         if msg is None:
             break
         b, c, h = msg
         obs = env.step(ActionChunk(torch.from_numpy(b), torch.from_numpy(c), torch.from_numpy(h)))
-        conn.send((obs.rgb, obs.event_ids, obs.event_text or ""))
+        conn.send((obs.rgb, obs.event_ids, obs.event_text or "", extra(obs)))
     env.close()
 
 

@@ -40,48 +40,70 @@ from .online import chunk_log_prob
 @dataclass(frozen=True)
 class Task:
     key: str
-    goal_text: str          # 交给 ``model.set_goal`` 编码的指令
-    base_rate: float        # BC 策略下每 1000 步的期望事件数，实测
-    match: Callable[[str], bool] | None = None   # 事件文本 -> 算不算数
-    positional: bool = False                     # 用位移而不是事件算奖励
+    goal_text: str           # 交给 ``model.set_goal`` 编码的指令
+    scale: float             # 把奖励缩放到"每千步量级 1.0"，见 reward_of
+    items: tuple[str, ...] = ()   # 物品栏里这些东西变多就算数
+    placed: bool = False          # 放置方块（``used *`` 事件）
+    positional: bool = False      # 用位移算
 
 
-def _has(*subs: str) -> Callable[[str], bool]:
-    return lambda e: any(s in e for s in subs)
-
-
-# base_rate 全部来自 BC 起点在 6000 步评测里的实测计数，换算成每千步。
-# **这些数字是这个模块最重要的部分**，理由见 normalised_reward。
+# **这张表是这个模块最重要的部分，也是上一版最烂的部分。** 上一版列了
+# dig / leaves / gather 三个任务，问题是：
+#
+#   * 单任务失败的病灶就是"去挖泥土草方块而不是砍树"，而 dig / leaves
+#     **在付钱让它继续这么干**；
+#   * gather = ``picked up *``，几乎是所有任务的超集 —— 那就是换了皮的
+#     ``any_mine``，而 ``any_mine`` 实测会让原木事件归零；
+#   * 没有一个通向"砍树然后盖个小房子"。"clear leaves and foliage" 不是
+#     任何人会提的需求，只是把 agent 本来就在乱做的事重新贴了个标签。
+#
+# 现在这四个都是**人真的会提的要求**，而且都在那条路径上。关键仍然是
+# ``place`` 和 ``travel`` —— 它们的最优解**不包含攻击**，所以"按住攻击键"
+# 不再是所有奖励轨迹的共同解。这是多任务在这里的全部意义。
 TASKS: tuple[Task, ...] = (
-    Task("wood",   "chop wood from a tree",      2.0,  _has("log")),
-    Task("dig",    "dig into the ground",       18.2,  _has("dirt", "grass block", "sand", "gravel")),
-    Task("leaves", "clear leaves and foliage",  11.7,  _has("leaves", "grass", "fern", "vine")),
-    Task("gather", "pick up items nearby",       9.0,  _has("picked up")),
-    Task("travel", "travel far from here",       1.0,  None, positional=True),
+    Task("wood",   "chop wood from a tree",    0.5, items=("log",)),
+    Task("stone",  "dig down and get stone",   0.5, items=("cobblestone", "stone")),
+    Task("place",  "build: place blocks here", 0.3, placed=True),
+    Task("travel", "travel far from here",     0.1, positional=True),
 )
 TASK_BY_KEY = {t.key: t for t in TASKS}
 
 
-def normalised_reward(task: Task, event_text: str, disp: float) -> float:
-    """把每个任务的奖励缩放到"BC 策略下每千步期望 1.0"。
+def _gained(inv_before: dict, inv_after: dict, keys: tuple[str, ...]) -> int:
+    """物品栏里这些东西**多了几个**。
 
-    **不做这一步，多任务必然退化成单任务。** 这是 ``tree`` 塑形失败的教训的推广：
-    那次用 ``0.3 × 树叶`` 加 ``1.0 × 原木``，而树叶约 50 次/1728 步、原木约 0 次，
-    塑形项按 **100:1** 淹没了目标信号，原木直接归零。
+    用物品栏而不是事件文本，是因为 ``mined oak log`` 和 ``picked up oak log``
+    是两条事件、同一根木头 —— 按文本子串计数会算两分。上一版的 ``"log" in p``
+    正是这个毛病。物品栏只记你手里真的有什么，不重不漏。
+    """
+    n = 0
+    for name, cnt in inv_after.items():
+        if any(k in name for k in keys):
+            n += max(0, cnt - inv_before.get(name, 0))
+    return n
 
-    这里的风险一模一样，只是换了个轴：``dig`` 的自然发生率是 ``wood`` 的 **9 倍**
-    （18.2 vs 2.0 次/千步）。不归一化的话，``dig`` 的优势幅度压倒一切 ——
-    而 ``ppo_update`` 的优势归一化是**跨整个 batch 全局**做的（必须如此，
-    否则抹掉任务间差异），所以幅度差会直接变成梯度权重差。
 
-    权重要按**事件频率**定，不能按语义重要性拍 —— 这条已经付过一次学费了。
+def reward_of(task: Task, inv_before: dict, inv_after: dict,
+              event_text: str, disp: float) -> float:
+    """一步的奖励，已按任务缩放。
+
+    ``scale`` 的作用和上一版的 base_rate 一样：把不同任务的奖励拉到同一量级。
+    **不做这一步多任务必然退化成单任务** —— 这是 ``tree`` 塑形失败的推广，
+    那次 ``0.3 × 树叶`` 加 ``1.0 × 原木``，实际频率是 100:1，原木直接归零。
+    而 ``ppo_update`` 的优势归一化是**跨 batch 全局**做的（必须如此，否则抹掉
+    任务间差异），所以幅度差会一比一变成梯度权重差。
+
+    但和上一版有个重要区别：上一版的 base_rate 是**拟合 BC 策略**量出来的，
+    而策略一变它就过期了。这里的 scale 是固定常数，只表达"一次事件值多少"，
+    不假设任何策略。
     """
     if task.positional:
-        return disp / task.base_rate * 1e-3 * 1000.0
-    if not event_text:
-        return 0.0
-    hits = sum(1 for p in event_text.split(", ") if p and task.match(p))
-    return hits / task.base_rate
+        return disp * task.scale
+    if task.placed:
+        if not event_text:
+            return 0.0
+        return task.scale * sum(1 for p in event_text.split(", ") if p.startswith("used "))
+    return task.scale * _gained(inv_before, inv_after, task.items)
 
 
 # --------------------------------------------------------------------------
@@ -98,15 +120,19 @@ def sample_goals(n: int, rng: np.random.Generator) -> list[Task]:
     return [TASKS[i] for i in rng.integers(0, len(TASKS), size=n)]
 
 
-def achieved_tasks(event_texts: list[str], disp: float) -> list[str]:
+def achieved_tasks(inv_first: dict, inv_last: dict,
+                   event_texts: list[str], disp: float) -> list[str]:
     """这段轨迹**实际上**完成了哪些任务（不管当时的目标是什么）。"""
     text = ", ".join(t for t in event_texts if t)
     out = []
     for t in TASKS:
         if t.positional:
-            if disp / t.base_rate >= 1.0:
+            if disp >= 20.0:                       # 走出 20 格才算真的"走远了"
                 out.append(t.key)
-        elif t.match and any(t.match(p) for p in text.split(", ") if p):
+        elif t.placed:
+            if any(p.startswith("used ") for p in text.split(", ") if p):
+                out.append(t.key)
+        elif _gained(inv_first, inv_last, t.items) > 0:
             out.append(t.key)
     return out
 
